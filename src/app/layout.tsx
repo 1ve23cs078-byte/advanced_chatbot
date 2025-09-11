@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import { AuthProvider } from "./AuthProvider";
+import { LoginControls } from "./LoginControls";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -24,10 +26,14 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased`}
-      >
-        {children}
+      <body className={`${geistSans.variable} ${geistMono.variable} antialiased`}>
+        <AuthProvider>
+          <div className="w-full border-b bg-white/70 dark:bg-neutral-900/70 backdrop-blur-sm flex items-center justify-between px-4 py-2 text-sm">
+            <div className="font-semibold">GenAI Basics Chatbot</div>
+            <LoginControls />
+          </div>
+          {children}
+        </AuthProvider>
       </body>
     </html>
   );

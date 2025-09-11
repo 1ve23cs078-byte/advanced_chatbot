@@ -3,7 +3,22 @@
 // Teaching comments inline; kept in a single component tree for clarity.
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import type { ChatMessage, ModelConfig, StreamEnvelope } from '../../lib/types';
+// Avoid importing Node's crypto polyfill in the browser; use Web Crypto if available.
+function generateUUID(): string {
+  try {
+    if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+      return (crypto as { randomUUID: () => string }).randomUUID();
+    }
+  } catch {}
+  // Fallback RFC4122-ish v4 generator.
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+import type { ChatMessage, ModelConfig, StreamEnvelope, ChatListItem, StoredChatSession, ChatListResponse } from '../../lib/types';
+import { useSession } from 'next-auth/react';
 
 const DEFAULT_CONFIG: ModelConfig = {
   model: 'gemini-1.5-pro',
@@ -41,6 +56,99 @@ export function Chat() {
   const abortRef = useRef<AbortController | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   const [lastPrompt, setLastPrompt] = useState('');
+  const [sessions, setSessions] = useState<ChatListItem[]>([]);
+  const [sessionSearch, setSessionSearch] = useState('');
+  const [page, setPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(1);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  // const [loadingSession, setLoadingSession] = useState(false); // reserved for future loading UX
+  const [saving, setSaving] = useState(false);
+  const { data: session } = useSession();
+
+  // Load session list on mount.
+  const refreshSessions = useCallback(async () => {
+    try {
+      const params = new URLSearchParams({ page: String(page) });
+      if (sessionSearch.trim()) params.set('q', sessionSearch.trim());
+      const res = await fetch(`/api/sessions?${params.toString()}`);
+      if (res.ok) {
+        const data: ChatListResponse = await res.json();
+        setSessions(data.items);
+        setTotalPages(data.totalPages);
+      }
+    } catch {}
+  }, [page, sessionSearch]);
+
+  useEffect(() => {
+    refreshSessions();
+  }, [page, sessionSearch, refreshSessions]);
+
+  const createSession = useCallback(async () => {
+    // Optimistic stub
+    const tempId = 'temp-' + Date.now();
+    const title = messages.find(m => m.role === 'user' && m.content.trim())?.content?.slice(0,60) || 'New Chat';
+    setSessions(s => [{ sessionId: tempId, title, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), model: config.model }, ...s]);
+    setActiveSessionId(tempId);
+    setSaving(true);
+    try {
+      const res = await fetch('/api/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title, messages, config }),
+      });
+      if (res.ok) {
+        const { sessionId } = await res.json();
+        setActiveSessionId(sessionId);
+      }
+    } catch {}
+    finally {
+      setSaving(false);
+      refreshSessions();
+    }
+  }, [messages, config, refreshSessions]);
+
+  const loadSession = useCallback(async (id: string) => {
+    try {
+      const res = await fetch(`/api/sessions/${id}`);
+      if (res.ok) {
+        const data: StoredChatSession = await res.json();
+        setMessages(data.messages);
+        setActiveSessionId(id);
+        setConfig(c => ({ ...c, model: data.model, temperature: data.temperature, topP: data.topP, maxTokens: data.maxTokens }));
+      }
+    } catch {}
+  }, [setMessages, setActiveSessionId, setConfig]);
+
+  const deleteSession = useCallback(async (id: string) => {
+    if (!confirm('Delete this chat?')) return;
+    try {
+      await fetch(`/api/sessions?id=${id}`, { method: 'DELETE' });
+      if (id === activeSessionId) {
+        setActiveSessionId(null);
+        reset();
+      }
+      refreshSessions();
+    } catch {}
+  }, [activeSessionId, refreshSessions]);
+
+  const startRename = (s: ChatListItem) => {
+    setRenamingId(s.sessionId);
+    setRenameValue(s.title);
+  };
+
+  const submitRename = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!renamingId) return;
+    const newTitle = renameValue.trim();
+    if (!newTitle) { setRenamingId(null); return; }
+    try {
+      await fetch('/api/sessions', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: renamingId, title: newTitle }) });
+      setSessions(s => s.map(item => item.sessionId === renamingId ? { ...item, title: newTitle } : item));
+    } catch {}
+    setRenamingId(null);
+  };
 
   // Persist config.
   useEffect(() => {
@@ -56,7 +164,14 @@ export function Chat() {
 
   const sendMessage = useCallback(async () => {
     if (!userInput.trim() || streaming) return;
-  const newMessages: ChatMessage[] = [...messages, { role: 'user', content: userInput }];
+    // If there is no active session yet but the user is authenticated, pre-generate a session id
+    // so the server can auto-create & persist from the very first message.
+    let sid = activeSessionId;
+    if (!sid && session) {
+      sid = generateUUID();
+      setActiveSessionId(sid);
+    }
+    const newMessages: ChatMessage[] = [...messages, { role: 'user', content: userInput }];
     setMessages(newMessages);
     setUserInput('');
     setPending({ text: '', tokens: 0 });
@@ -71,8 +186,9 @@ export function Chat() {
           messages: newMessages,
           model: config.model,
           temperature: config.temperature,
-            topP: config.topP,
+          topP: config.topP,
           maxTokens: config.maxTokens,
+          sessionId: sid || undefined,
         }),
         headers: { 'Content-Type': 'application/json' },
         signal: abortRef.current.signal,
@@ -94,8 +210,9 @@ export function Chat() {
           if (!line.startsWith('data:')) continue;
           const json = line.replace(/^data: /, '');
           if (json === '[DONE]') {
-            // Commit assistant message.
+            // Commit assistant message (server already persisted both sides if session established).
             setMessages(m => [...m, { role: 'assistant', content: fullText }]);
+            refreshSessions();
             setPending(p => (p ? { ...p } : p));
             setStreaming(false);
             setPending(null);
@@ -126,7 +243,7 @@ export function Chat() {
       setPending(null);
       setMessages(m => [...m, { role: 'assistant', content: '[Request failed]' }]);
     }
-  }, [userInput, messages, config, streaming]);
+  }, [userInput, messages, config, streaming, activeSessionId, refreshSessions, session]);
 
   const stop = () => {
     abortRef.current?.abort();
@@ -197,6 +314,75 @@ export function Chat() {
         </form>
       </div>
       <aside className="w-80 hidden md:flex flex-col gap-4 text-sm" aria-label="Controls panel">
+        {!session && (
+          <section className="border rounded-md p-3 text-xs space-y-2">
+            <p className="font-semibold">Login to save chats</p>
+            <p>Authentication enables: persistent sessions, rename, search.</p>
+          </section>
+        )}
+        {session && (
+        <section className="border rounded-md p-3 space-y-2">
+          <div className="flex justify-between items-center">
+            <h2 className="font-semibold text-sm">Sessions</h2>
+            <button
+              type="button"
+              onClick={createSession}
+              disabled={saving}
+              className="text-xs px-2 py-1 rounded bg-green-600 text-white disabled:opacity-50"
+            >
+              {saving ? 'Saving…' : 'Save'}
+            </button>
+          </div>
+          <div className="flex gap-2 items-center">
+            <input
+              type="text"
+              value={sessionSearch}
+              onChange={e => { setSessionSearch(e.target.value); setPage(1); }}
+              placeholder="Search..."
+              className="w-full border rounded px-2 py-1 text-xs"
+            />
+          </div>
+          <div className="space-y-1 max-h-40 overflow-auto">
+            {sessions.map(s => (
+              <div key={s.sessionId} className={`flex items-center gap-1 text-xs p-1 rounded ${s.sessionId === activeSessionId ? 'bg-blue-100 dark:bg-blue-900/40' : 'hover:bg-gray-100 dark:hover:bg-neutral-800'}`}> 
+                {renamingId === s.sessionId ? (
+                  <form onSubmit={submitRename} className="flex gap-1 flex-1">
+                    <input autoFocus value={renameValue} onChange={e => setRenameValue(e.target.value)} className="flex-1 border rounded px-1" />
+                    <button type="submit" className="px-1 text-green-600">✔</button>
+                    <button type="button" onClick={() => setRenamingId(null)} className="px-1 text-gray-500">✕</button>
+                  </form>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      className="flex-1 text-left truncate"
+                      title={s.title}
+                      onClick={() => loadSession(s.sessionId)}
+                    >
+                      {s.title || 'Untitled'}
+                    </button>
+                    <button type="button" onClick={() => startRename(s)} className="text-blue-600 px-1" aria-label="Rename">✎</button>
+                    <button
+                      type="button"
+                      onClick={() => deleteSession(s.sessionId)}
+                      className="text-red-600 px-1"
+                      aria-label="Delete session"
+                    >×</button>
+                  </>
+                )}
+              </div>
+            ))}
+            {!sessions.length && <p className="text-[10px] text-gray-500">No sessions yet.</p>}
+          </div>
+          {totalPages > 1 && (
+            <div className="flex justify-between items-center text-[10px] mt-1">
+              <button disabled={page<=1} onClick={() => setPage(p => Math.max(1, p-1))} className="px-1 py-0.5 border rounded disabled:opacity-40">Prev</button>
+              <span>Page {page}/{totalPages}</span>
+              <button disabled={page>=totalPages} onClick={() => setPage(p => Math.min(totalPages, p+1))} className="px-1 py-0.5 border rounded disabled:opacity-40">Next</button>
+            </div>
+          )}
+        </section>
+  )}
         <section className="border rounded-md p-3 space-y-3">
           <h2 className="font-semibold text-sm">Model & Parameters</h2>
           <label className="flex flex-col gap-1">
