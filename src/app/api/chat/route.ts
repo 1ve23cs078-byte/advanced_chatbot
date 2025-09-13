@@ -5,7 +5,7 @@
 
 import { NextRequest } from 'next/server';
 import { streamGemini } from '../../../lib/ai/gemini';
-import type { ChatRequestBody, ChatMessage } from '../../../lib/types';
+import type { ChatRequestBody, ChatMessage, StoredChatSession } from '../../../lib/types';
 import { chatsCollection } from '../../../lib/db';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '../../../lib/auth';
@@ -40,7 +40,7 @@ export async function POST(req: NextRequest) {
         if (!existing) {
           // First time seeing this sessionId: create full session document with all messages so far.
           const title = messages.find(m => m.role === 'user' && m.content.trim())?.content.slice(0, 60) || 'New Chat';
-          await col.insertOne({
+          const newSession: StoredChatSession = {
             sessionId,
             title,
             messages, // includes system + current user message(s)
@@ -51,7 +51,8 @@ export async function POST(req: NextRequest) {
             userId,
             createdAt: nowIso,
             updatedAt: nowIso,
-          } as any);
+          };
+          await col.insertOne(newSession);
         } else {
           const lastUser = [...messages].reverse().find(m => m.role === 'user');
           if (lastUser) {
